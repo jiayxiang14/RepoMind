@@ -1,0 +1,16 @@
+# 环境变量（绝对不能上传）
+.env
+
+# 向量数据库（本地数据，体积大）
+data/
+
+# Python 虚拟环境
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
