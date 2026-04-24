@@ -82,7 +82,7 @@ IGNORED_EXTENSIONS = {
 
 MAX_FILE_SIZE_BYTES = 200 * 1024  # 200KB，超过则跳过
 
-# 扩展名 → 语言映射
+# 扩展名 → 语言映射 缩写容易有歧义
 EXT_TO_LANGUAGE = {
     ".py": "python", ".js": "javascript", ".ts": "typescript",
     ".java": "java", ".go": "go", ".rs": "rust", ".cpp": "cpp",
@@ -113,9 +113,10 @@ class GitHubLoader:
     """
 
     def __init__(self, token: Optional[str] = None):
-        _token = token or config.GITHUB_TOKEN
+        #有 Token：可访问私有仓库，API 限速更宽松. 无 Token：仅能访问公开仓库
+        _token = token or config.GITHUB_TOKEN # 优先使用传入的 Token，否则使用配置文件中的 Token
         self.gh = Github(_token) if _token else Github()
-        self.max_files = config.MAX_GITHUB_FILES
+        self.max_files = config.MAX_GITHUB_FILES # 从配置读取最大文件下载数量限制
 
     # ----------------------------------------------------------
     # 公共接口

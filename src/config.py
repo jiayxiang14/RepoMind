@@ -31,6 +31,12 @@ class Config:
     CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "1000"))
     CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "200"))
 
+    # ---- Reranker 参数 ----
+    RERANKER_ENABLED: bool = os.getenv("RERANKER_ENABLED", "true").lower() == "true"
+    RERANKER_MODEL: str = os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+    # 向量检索候选数 = TOP_K * RERANKER_CANDIDATE_MULTIPLIER，再由 CrossEncoder 精排到 TOP_K
+    RERANKER_CANDIDATE_MULTIPLIER: int = int(os.getenv("RERANKER_CANDIDATE_MULTIPLIER", "4"))
+
     # ---- 应用 ----
     APP_TITLE: str = os.getenv("APP_TITLE", "RAG 智能知识库")
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")

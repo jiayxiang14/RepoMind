@@ -18,6 +18,7 @@ from typing import Generator, Optional
 from openai import OpenAI
 
 from src.config import config
+from src.rag.reranker import Reranker
 from src.vectorstore.chroma_store import ChromaStore, SearchResult
 
 logger = logging.getLogger(__name__)
@@ -109,6 +110,8 @@ class RAGPipeline:
         self.store = store or ChromaStore()
         self.client = OpenAI(api_key=config.OPENAI_API_KEY)
         self.model = config.OPENAI_CHAT_MODEL
+        # Reranker：二阶段精排，RERANKER_ENABLED=false 时自动 fallback 到原始排序
+        self.reranker = Reranker(model_name=config.RERANKER_MODEL) if config.RERANKER_ENABLED else None
 
     # ----------------------------------------------------------
     # 主接口
@@ -135,10 +138,16 @@ class RAGPipeline:
         Returns:
             RAGResponse（含答案 + 引用来源）
         """
-        # 1. 检索相关分块
+        # 1. 检索相关分块（开启 Reranker 时先多取候选，再精排）
+        final_top_k = top_k or config.RETRIEVAL_TOP_K
+        candidate_k = (
+            final_top_k * config.RERANKER_CANDIDATE_MULTIPLIER
+            if self.reranker and self.reranker.enabled
+            else final_top_k
+        )
         results = self.store.search(
             query=question,
-            top_k=top_k or config.RETRIEVAL_TOP_K,
+            top_k=candidate_k,
             language_filter=language_filter,
             file_type_filter=file_type_filter,
         )
@@ -150,6 +159,11 @@ class RAGPipeline:
                 query=question,
                 context_chunks_used=0,
             )
+
+        # 1b. Reranker 精排
+        if self.reranker and self.reranker.enabled:
+            results = self.reranker.rerank(query=question, chunks=results, top_k=final_top_k)
+            logger.debug(f"Reranker 精排完成，保留 {len(results)} 个分块")
 
         # 2. 构建上下文
         context_text = self._build_context(results)
@@ -194,9 +208,15 @@ class RAGPipeline:
         Yields:
             文本片段（delta）
         """
+        final_top_k = top_k or config.RETRIEVAL_TOP_K
+        candidate_k = (
+            final_top_k * config.RERANKER_CANDIDATE_MULTIPLIER
+            if self.reranker and self.reranker.enabled
+            else final_top_k
+        )
         results = self.store.search(
             query=question,
-            top_k=top_k or config.RETRIEVAL_TOP_K,
+            top_k=candidate_k,
             language_filter=language_filter,
             file_type_filter=file_type_filter,
         )
@@ -204,6 +224,9 @@ class RAGPipeline:
         if not results:
             yield "知识库中暂无相关内容，请先添加 GitHub 仓库或本地文档。"
             return
+
+        if self.reranker and self.reranker.enabled:
+            results = self.reranker.rerank(query=question, chunks=results, top_k=final_top_k)
 
         context_text = self._build_context(results)
         messages = self._build_messages(question, context_text, history)

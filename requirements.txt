@@ -20,6 +20,9 @@ langgraph>=0.2.0          # ReAct Agent 编排核心
 PyGithub>=2.3.0
 gitpython>=3.1.40
 
+# --- Reranker（二阶段精排）---
+sentence-transformers>=3.0.0          # CrossEncoder 精排模型，本地运行无 API 费用
+
 # --- 文档处理 ---
 tiktoken>=0.7.0           # Token计数
 pypdf>=4.0.0              # PDF解析

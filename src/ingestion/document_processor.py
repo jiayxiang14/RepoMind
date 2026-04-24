@@ -8,6 +8,7 @@
 - 每个 Chunk 携带丰富元数据（来源、语言、行号等）
 """
 
+import ast
 import re
 import logging
 from dataclasses import dataclass, field
@@ -199,14 +200,45 @@ class DocumentProcessor:
 
     @staticmethod
     def _find_code_boundaries(lines: list[str], language: str) -> list[int]:
-        """找函数/类定义的起始行号（0-indexed）"""
+        """
+        找函数/类定义的起始行号（0-indexed）
+
+        Python 文件优先用 ast 模块精确解析语法树，获取每个顶层和类内方法的边界。
+        其他语言回退到正则匹配。
+
+        为什么要用 ast 而不是正则：
+          正则只能识别顶层 def/class，一个类里有 10 个方法时，
+          整个类会被当成一个 chunk，超过 chunk_size 后被强制截断，
+          函数签名和函数体可能落入不同 chunk。
+          ast 能精确拿到每个方法的起止行号，切割结果语义更完整。
+        """
+        # ── Python：用 ast 精确解析 ──────────────────────────────
+        if language == "python":
+            source = "\n".join(lines)
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
+                # 解析失败（如不完整代码片段）→ 回退到正则
+                pass
+            else:
+                boundary_set = {0}
+                for node in ast.walk(tree):
+                    # 顶层函数、类、以及类内方法都作为切割点
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        # lineno 是 1-indexed，转成 0-indexed
+                        boundary_set.add(node.lineno - 1)
+                boundaries = sorted(boundary_set)
+                return boundaries if len(boundaries) > 1 else [0]
+
+        # ── 其他语言：正则匹配顶层边界 ───────────────────────────
         patterns = {
-            "python": r"^(def |class |async def )\w",
-            "javascript": r"^(function |class |const \w+ = \(|const \w+ = async)",
-            "typescript": r"^(function |class |const \w+ = \(|interface |type )",
-            "java": r"^\s*(public|private|protected|static).*\{$",
-            "go": r"^func ",
-            "rust": r"^(pub )?(fn |struct |impl |enum )",
+            "javascript": r"^(export\s+)?(async\s+)?function\s+\w|^(export\s+)?class\s+\w|^const\s+\w+\s*=\s*(async\s*)?\(",
+            "typescript": r"^(export\s+)?(async\s+)?function\s+\w|^(export\s+)?class\s+\w|^(export\s+)?interface\s+\w|^(export\s+)?type\s+\w",
+            "java":       r"^\s*(public|private|protected|static)[\w\s<>\[\]]+\s+\w+\s*\(",
+            "go":         r"^func\s+",
+            "rust":       r"^(pub\s+)?(async\s+)?(fn|struct|impl|enum|trait)\s+\w",
+            "kotlin":     r"^(fun|class|object|interface)\s+\w",
+            "swift":      r"^(func|class|struct|enum|protocol)\s+\w",
         }
         pattern = patterns.get(language, r"^(def |func |function |class )\w")
         boundaries = [0]
