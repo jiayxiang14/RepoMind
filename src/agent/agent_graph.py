@@ -26,12 +26,19 @@ LangGraph ReAct Agent 编排层
   - ReAct Agent：LLM 自己决定要不要检索、检索什么、要不要再查 GitHub，
                   可以多步推理，答案更准确
 
+死循环防护（三层）：
+  1. recursion_limit   — LangGraph 原生限制，超过 N 步直接抛异常终止
+  2. 重复检测          — _agent_node 检查连续两次相同工具+参数调用，主动注入停止提示
+  3. 超时控制          — invoke/stream 外层用 ThreadPoolExecutor 限制总执行时间
+
 面试亮点关键词：
   LangGraph StateGraph / ToolNode / conditional_edges /
-  Human-in-the-loop / 中断点（interrupt） / 流式输出
+  recursion_limit / 重复检测 / 超时控制 / 流式输出
 """
 
+import concurrent.futures
 import logging
+import time
 from typing import Annotated, Generator, Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -45,6 +52,14 @@ from src.config import config
 from src.agent.tools import build_tools
 
 logger = logging.getLogger(__name__)
+
+# ============================================================
+# 死循环防护常量
+# ============================================================
+
+MAX_STEPS = 10          # recursion_limit：最多 10 步工具调用
+AGENT_TIMEOUT = 60      # 超时控制：最多等待 60 秒
+REPEAT_WINDOW = 2       # 重复检测：连续 N 次相同调用视为死循环
 
 
 # ============================================================
@@ -166,12 +181,40 @@ class RAGAgent:
         LLM 输出可能是：
           (a) 普通文本消息 → 结束
           (b) tool_calls → 需要执行工具
+
+        内置重复检测：若连续 REPEAT_WINDOW 次调用完全相同的工具+参数，
+        注入一条系统提示强制 LLM 停止重复并直接给出答案。
         """
         messages = state["messages"]
 
         # 确保系统提示在最前面
         if not messages or not isinstance(messages[0], SystemMessage):
             messages = [SystemMessage(content=AGENT_SYSTEM_PROMPT)] + list(messages)
+
+        # ── 重复检测 ──────────────────────────────────────────────
+        # 提取历史中所有工具调用记录：(tool_name, args_str) 元组列表
+        recent_tool_calls = [
+            (tc["name"], str(tc.get("args", {})))
+            for msg in messages
+            if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None)
+            for tc in msg.tool_calls
+        ]
+
+        if len(recent_tool_calls) >= REPEAT_WINDOW:
+            last_n = recent_tool_calls[-REPEAT_WINDOW:]
+            # 如果最近 N 次调用完全一样，注入停止提示
+            if len(set(last_n)) == 1:
+                logger.warning(
+                    f"检测到重复工具调用: {last_n[0][0]}，连续 {REPEAT_WINDOW} 次，注入停止提示"
+                )
+                stop_hint = HumanMessage(
+                    content=(
+                        "【系统提示】你已经连续多次调用了相同的工具，"
+                        "获取到的信息已经足够。请直接基于已有结果给出最终答案，不要再调用工具。"
+                    )
+                )
+                messages = list(messages) + [stop_hint]
+        # ── 重复检测结束 ──────────────────────────────────────────
 
         response = self.llm.invoke(messages)
         return {"messages": [response]}
@@ -202,6 +245,10 @@ class RAGAgent:
         """
         同步调用，返回完整结果
 
+        死循环防护：
+          - recursion_limit=MAX_STEPS：LangGraph 原生步数限制，超出抛 GraphRecursionError
+          - AGENT_TIMEOUT 秒超时：ThreadPoolExecutor 包裹，超时返回友好提示
+
         Returns:
             {
                 "answer": str,          # 最终答案
@@ -210,7 +257,36 @@ class RAGAgent:
             }
         """
         messages = self._build_initial_messages(question, history)
-        final_state = self.graph.invoke({"messages": messages})
+
+        # ── 超时控制 + recursion_limit ────────────────────────────
+        invoke_config = {"recursion_limit": MAX_STEPS}
+
+        def _run():
+            return self.graph.invoke({"messages": messages}, config=invoke_config)
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_run)
+                try:
+                    final_state = future.result(timeout=AGENT_TIMEOUT)
+                except concurrent.futures.TimeoutError:
+                    logger.warning(f"Agent 超时（>{AGENT_TIMEOUT}s），强制终止")
+                    return {
+                        "answer": f"查询超时（超过 {AGENT_TIMEOUT} 秒），请尝试简化问题后重试。",
+                        "steps": [],
+                        "tool_calls_count": 0,
+                    }
+        except Exception as e:
+            # 捕获 recursion_limit 触发的 GraphRecursionError
+            if "recursion" in str(e).lower() or "GraphRecursionError" in type(e).__name__:
+                logger.warning(f"Agent 超出最大步数限制（{MAX_STEPS} 步）")
+                return {
+                    "answer": f"推理步数超出限制（最多 {MAX_STEPS} 步），已中止。请尝试更具体的问题。",
+                    "steps": [],
+                    "tool_calls_count": MAX_STEPS,
+                }
+            raise
+        # ── 超时控制结束 ──────────────────────────────────────────
 
         # 提取最终答案和中间步骤
         answer = ""
@@ -255,42 +331,65 @@ class RAGAgent:
         """
         流式调用，逐步 yield 事件（用于 Streamlit 实时展示）
 
+        死循环防护：
+          - recursion_limit=MAX_STEPS：步数限制
+          - 超时后 yield 错误提示并终止生成
+
         Yields:
             {"type": "tool_start", "tool": "search_knowledge_base", "args": {...}}
             {"type": "tool_end",   "tool": "search_knowledge_base", "result": "..."}
             {"type": "token",      "content": "这是"}
             {"type": "token",      "content": "答案"}
             {"type": "done"}
+            {"type": "error",      "content": "..."}  # 超时或步数超限时
         """
         messages = self._build_initial_messages(question, history)
+        invoke_config = {"recursion_limit": MAX_STEPS}
 
-        for event in self.graph.stream(
-            {"messages": messages},
-            stream_mode="updates",
-        ):
-            for node_name, node_output in event.items():
-                for msg in node_output.get("messages", []):
-                    if isinstance(msg, AIMessage):
-                        if msg.tool_calls:
-                            # Agent 决定调用工具
-                            for tc in msg.tool_calls:
-                                yield {
-                                    "type": "tool_start",
-                                    "tool": tc["name"],
-                                    "args": tc["args"],
-                                }
-                        elif msg.content:
-                            # Agent 生成最终答案（逐字输出）
-                            for char in msg.content:
-                                yield {"type": "token", "content": char}
+        start_time = time.time()
 
-                    elif isinstance(msg, ToolMessage):
-                        # 工具执行完毕
-                        yield {
-                            "type": "tool_end",
-                            "tool": msg.name,
-                            "result": msg.content[:300] + "..." if len(msg.content) > 300 else msg.content,
-                        }
+        try:
+            for event in self.graph.stream(
+                {"messages": messages},
+                config=invoke_config,
+                stream_mode="updates",
+            ):
+                # 超时检查（流式场景下在每个事件前检查）
+                if time.time() - start_time > AGENT_TIMEOUT:
+                    logger.warning(f"Agent 流式超时（>{AGENT_TIMEOUT}s）")
+                    yield {"type": "error", "content": f"查询超时（超过 {AGENT_TIMEOUT} 秒），已中止。"}
+                    return
+
+                for node_name, node_output in event.items():
+                    for msg in node_output.get("messages", []):
+                        if isinstance(msg, AIMessage):
+                            if msg.tool_calls:
+                                # Agent 决定调用工具
+                                for tc in msg.tool_calls:
+                                    yield {
+                                        "type": "tool_start",
+                                        "tool": tc["name"],
+                                        "args": tc["args"],
+                                    }
+                            elif msg.content:
+                                # Agent 生成最终答案（逐字输出）
+                                for char in msg.content:
+                                    yield {"type": "token", "content": char}
+
+                        elif isinstance(msg, ToolMessage):
+                            # 工具执行完毕
+                            yield {
+                                "type": "tool_end",
+                                "tool": msg.name,
+                                "result": msg.content[:300] + "..." if len(msg.content) > 300 else msg.content,
+                            }
+
+        except Exception as e:
+            if "recursion" in str(e).lower() or "GraphRecursionError" in type(e).__name__:
+                logger.warning(f"Agent 流式超出最大步数限制（{MAX_STEPS} 步）")
+                yield {"type": "error", "content": f"推理步数超出限制（最多 {MAX_STEPS} 步），已中止。"}
+            else:
+                raise
 
         yield {"type": "done"}
 
